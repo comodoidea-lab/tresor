@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { 
-  View, Text, TextInput, TouchableOpacity, ScrollView, 
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import {
+  View, Text, TextInput, TouchableOpacity, ScrollView,
   SafeAreaView, Modal, Alert, Platform, KeyboardAvoidingView,
-  useColorScheme as useSystemColorScheme, LogBox, StatusBar
+  useColorScheme as useSystemColorScheme, LogBox, StatusBar,
+  Animated, PanResponder
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
@@ -10,7 +11,8 @@ import {
   ChevronRight, PlusCircle, MinusCircle, Trash2, Save, X,
   Layers, MapPin, Tag, Hash, ExternalLink, ChevronDown,
   Sparkles, Filter, Clock, ArrowRight, BookOpen, AlertCircle,
-  Download, Upload, Moon, Sun, Smartphone, CheckSquare, Square, Bell
+  Download, Upload, Moon, Sun, Smartphone, CheckSquare, Square, Bell,
+  GripVertical
 } from 'lucide-react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
 
@@ -20,6 +22,9 @@ import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import { useColorScheme } from 'nativewind';
 import * as Notifications from 'expo-notifications';
+import { Swipeable } from 'react-native-gesture-handler';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as WebBrowser from 'expo-web-browser';
 
 // 内部警告を画面に出さないようにする
 LogBox.ignoreLogs([
@@ -68,14 +73,96 @@ const PRESET_TEMPLATES = [
     subLocations: ["スーパー", "コンビニ", "ドラッグストア", "ホームセンター", "ネット"],
     attributes: [
       { name: "購入済み", type: "checkbox" },
-      { name: "数量", type: "number" },
+      { name: "購入期限", type: "date" },
       { name: "予算(円)", type: "number" },
       { name: "メモ", type: "text" }
+    ]
+  },
+  {
+    name: "アイデアノート",
+    subLocations: ["仕事", "プライベート", "読書メモ", "旅行", "その他"],
+    attributes: [
+      { name: "カテゴリ", type: "tag" },
+      { name: "メモ", type: "text" },
+      { name: "参考URL", type: "url" },
+      { name: "実行済み", type: "checkbox" }
     ]
   }
 ];
 
 const generateId = () => Math.random().toString(36).substring(2, 11);
+
+// --- Draggable Row (drag to reorder + swipe to delete) ---
+function DraggableRow({ children, onDelete, onDragStart, onDragEnd }) {
+  const translateY = useRef(new Animated.Value(0)).current;
+  const [isActive, setIsActive] = useState(false);
+
+  const onDragStartRef = useRef(onDragStart);
+  const onDragEndRef = useRef(onDragEnd);
+  onDragStartRef.current = onDragStart;
+  onDragEndRef.current = onDragEnd;
+
+  const panHandlers = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_, gs) =>
+        Math.abs(gs.dy) > 6 && Math.abs(gs.dy) > Math.abs(gs.dx) * 1.5,
+      onPanResponderGrant: () => {
+        setIsActive(true);
+        onDragStartRef.current();
+      },
+      onPanResponderMove: Animated.event([null, { dy: translateY }], { useNativeDriver: false }),
+      onPanResponderRelease: (_, gs) => {
+        setIsActive(false);
+        Animated.spring(translateY, { toValue: 0, useNativeDriver: false, tension: 80, friction: 8 }).start();
+        onDragEndRef.current(gs.dy);
+      },
+      onPanResponderTerminate: (_, gs) => {
+        setIsActive(false);
+        Animated.spring(translateY, { toValue: 0, useNativeDriver: false }).start();
+        onDragEndRef.current(gs.dy);
+      },
+    })
+  ).current;
+
+  const renderRightActions = () => (
+    <View style={{ justifyContent: 'center', paddingLeft: 8 }}>
+      <TouchableOpacity
+        onPress={onDelete}
+        style={{ width: 64, aspectRatio: 1, backgroundColor: '#ef4444', borderRadius: 20, justifyContent: 'center', alignItems: 'center' }}
+      >
+        <Trash2 size={22} color="white" />
+      </TouchableOpacity>
+    </View>
+  );
+
+  return (
+    <Swipeable renderRightActions={renderRightActions} overshootRight={false} rightThreshold={40}>
+      <Animated.View
+        style={{
+          transform: [{ translateY }],
+          zIndex: isActive ? 10 : 1,
+          ...Platform.select({
+            ios: {
+              shadowColor: '#000',
+              shadowOffset: { width: 0, height: isActive ? 6 : 0 },
+              shadowOpacity: isActive ? 0.15 : 0,
+              shadowRadius: isActive ? 10 : 0,
+            },
+            android: { elevation: isActive ? 8 : 0 },
+          }),
+        }}
+      >
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <View {...panHandlers.panHandlers} style={{ paddingHorizontal: 6, paddingVertical: 14 }}>
+            <GripVertical size={20} color={isActive ? '#f59e0b' : '#cbd5e1'} />
+          </View>
+          <View style={{ flex: 1 }}>{children}</View>
+        </View>
+      </Animated.View>
+    </Swipeable>
+  );
+}
 
 // --- Custom Components ---
 const CustomSelect = ({ value, options, onChange, placeholder = "選択してください" }) => {
@@ -123,19 +210,24 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [templates, setTemplates] = useState([]);
   const [items, setItems] = useState([]);
-  
+
   const [isAddingItem, setIsAddingItem] = useState(false);
   const [itemToEdit, setItemToEdit] = useState(null);
   const [templateToEdit, setTemplateToEdit] = useState(null);
   const [isAddingTemplate, setIsAddingTemplate] = useState(false);
-  
+
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTemplateFilter, setSelectedTemplateFilter] = useState('all');
   const [activeAttributeFilter, setActiveAttributeFilter] = useState(null);
-  
+
   const [showPresets, setShowPresets] = useState(false);
   const [showTutorial, setShowTutorial] = useState(false);
   const [themeSetting, setThemeSetting] = useState('system');
+  const [notifyDaysBefore, setNotifyDaysBefore] = useState(3);
+  const [notifyHour, setNotifyHour] = useState(9);
+
+  const scrollRef = useRef(null);
+  const insets = useSafeAreaInsets();
 
   // --- Push Notification Setup ---
   Notifications.setNotificationHandler({
@@ -154,15 +246,14 @@ export default function App() {
   const scheduleExpiryNotification = async (itemName: string, dateValue: string) => {
     const expiry = new Date(dateValue);
     if (isNaN(expiry.getTime())) return;
-    // 期限3日前の9時に通知
     const notifyAt = new Date(expiry);
-    notifyAt.setDate(notifyAt.getDate() - 3);
-    notifyAt.setHours(9, 0, 0, 0);
+    notifyAt.setDate(notifyAt.getDate() - notifyDaysBefore);
+    notifyAt.setHours(notifyHour, 0, 0, 0);
     if (notifyAt <= new Date()) return;
     await Notifications.scheduleNotificationAsync({
       content: {
         title: '⏰ もうすぐ期限切れ',
-        body: `「${itemName}」の期限まであと3日です`,
+        body: `「${itemName}」の期限まであと${notifyDaysBefore}日です`,
         sound: true,
       },
       trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: notifyAt },
@@ -179,11 +270,15 @@ export default function App() {
         const storedItems = await AsyncStorage.getItem('@tresor_items');
         tutorialDone = await AsyncStorage.getItem('@tresor_tutorial_done');
         const savedTheme = await AsyncStorage.getItem('@tresor_theme');
+        const savedNotifyDays = await AsyncStorage.getItem('@tresor_notify_days');
+        const savedNotifyHour = await AsyncStorage.getItem('@tresor_notify_hour');
 
         if (savedTheme) {
           setThemeSetting(savedTheme);
           setColorScheme(savedTheme === 'system' ? systemColorScheme : savedTheme);
         }
+        if (savedNotifyDays) setNotifyDaysBefore(Number(savedNotifyDays));
+        if (savedNotifyHour) setNotifyHour(Number(savedNotifyHour));
 
         parsedTemplates = storedTemplates ? JSON.parse(storedTemplates) : [];
         setTemplates(parsedTemplates);
@@ -211,7 +306,7 @@ export default function App() {
         matchAttr = item.attributes?.[activeAttributeFilter.key] === activeAttributeFilter.value;
       }
       return matchSearch && matchTemp && matchAttr;
-    }).sort((a, b) => b.updatedAt - a.updatedAt);
+    });
   }, [items, searchQuery, selectedTemplateFilter, activeAttributeFilter]);
 
   const alertItems = useMemo(() => {
@@ -397,6 +492,45 @@ export default function App() {
     } catch (e) { console.log(e); }
   };
 
+  const changeNotifyDays = async (days) => {
+    setNotifyDaysBefore(days);
+    await AsyncStorage.setItem('@tresor_notify_days', String(days));
+  };
+
+  const changeNotifyHour = async (hour) => {
+    setNotifyHour(hour);
+    await AsyncStorage.setItem('@tresor_notify_hour', String(hour));
+  };
+
+  const handleReorderFilteredItems = (fromFilteredIndex, toFilteredIndex) => {
+    if (fromFilteredIndex === toFilteredIndex) return;
+    const fromId = filteredItems[fromFilteredIndex]?.id;
+    const toId = filteredItems[toFilteredIndex]?.id;
+    if (!fromId || !toId) return;
+    const fromIndex = items.findIndex(i => i.id === fromId);
+    const toIndex = items.findIndex(i => i.id === toId);
+    const newItems = [...items];
+    const [moved] = newItems.splice(fromIndex, 1);
+    newItems.splice(toIndex, 0, moved);
+    setItems(newItems);
+    saveToStorage('@tresor_items', newItems);
+  };
+
+  const handleReorderTemplates = (fromIndex, toIndex) => {
+    if (fromIndex === toIndex) return;
+    const newTemplates = [...templates];
+    const [moved] = newTemplates.splice(fromIndex, 1);
+    newTemplates.splice(toIndex, 0, moved);
+    setTemplates(newTemplates);
+    saveToStorage('@tresor_templates', newTemplates);
+  };
+
+  const deleteItemImmediate = async (id) => {
+    const newItems = items.filter(i => i.id !== id);
+    setItems(newItems);
+    await saveToStorage('@tresor_items', newItems);
+  };
+
   // --- Tab Navigation Component ---
   const SidebarItem = ({ id, icon: Icon, label }) => (
     <TouchableOpacity activeOpacity={0.7} onPress={() => setActiveTab(id)} className="flex-1 items-center justify-center py-3">
@@ -416,7 +550,7 @@ export default function App() {
         </View>
       </View>
 
-      <ScrollView className="flex-1 px-4 pt-4" contentContainerStyle={{ paddingBottom: 100 }}>
+      <ScrollView ref={scrollRef} className="flex-1 px-4 pt-4" contentContainerStyle={{ paddingBottom: 100 + insets.bottom }}>
         
         {/* DASHBOARD TAB */}
         {activeTab === 'dashboard' && (
@@ -557,81 +691,95 @@ export default function App() {
             )}
 
             <View style={{ gap: 12 }}>
-              {filteredItems.map(item => (
-                <TouchableOpacity 
-                  key={item.id} activeOpacity={0.8}
-                  onPress={() => { setItemToEdit(item); setIsAddingItem(true); }}
-                  className="bg-white dark:bg-slate-800 p-4 rounded-[2rem] shadow-sm border border-slate-100 dark:border-slate-700"
+              {filteredItems.map((item, index) => (
+                <DraggableRow
+                  key={item.id}
+                  onDelete={() => deleteItemImmediate(item.id)}
+                  onDragStart={() => scrollRef.current?.setNativeProps({ scrollEnabled: false })}
+                  onDragEnd={(dy) => {
+                    scrollRef.current?.setNativeProps({ scrollEnabled: true });
+                    const delta = Math.round(dy / 110);
+                    if (delta !== 0) handleReorderFilteredItems(index, Math.max(0, Math.min(filteredItems.length - 1, index + delta)));
+                  }}
                 >
-                  <View className="flex-row items-start" style={{ gap: 16 }}>
-                    <View className="w-12 h-12 bg-slate-50 dark:bg-slate-700 rounded-2xl items-center justify-center"><Box size={24} color="#cbd5e1" /></View>
-                    <View className="flex-1 justify-center py-1">
-                      <View className="flex-row items-center justify-between">
-                        <Text className="font-bold text-slate-800 dark:text-white text-sm flex-1" numberOfLines={2}>{item.name}</Text>
-                      </View>
-                      <View className="flex-row flex-wrap items-center mt-1.5" style={{ gap: 8 }}>
-                        <View className="bg-slate-100 dark:bg-slate-700 px-2 py-1 rounded-md">
-                          <Text className="text-[10px] text-slate-500 dark:text-slate-300 font-bold">{templates.find(t => t.id === item.templateId)?.name || '未分類'}</Text>
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    onPress={() => { setItemToEdit(item); setIsAddingItem(true); }}
+                    className="flex-1 bg-white dark:bg-slate-800 p-4 rounded-[2rem] shadow-sm border border-slate-100 dark:border-slate-700"
+                  >
+                    <View className="flex-row items-start" style={{ gap: 16 }}>
+                      <View className="w-12 h-12 bg-slate-50 dark:bg-slate-700 rounded-2xl items-center justify-center"><Box size={24} color="#cbd5e1" /></View>
+                      <View className="flex-1 justify-center py-1">
+                        <View className="flex-row items-center justify-between">
+                          <Text className="font-bold text-slate-800 dark:text-white text-sm flex-1" numberOfLines={2}>{item.name}</Text>
                         </View>
-                        {item.subLocation ? (
-                          <View className="flex-row items-center" style={{ gap: 4 }}>
-                            <MapPin size={10} color="#d97706" />
-                            <Text className="text-[10px] text-amber-600 font-bold">{item.subLocation}</Text>
+                        <View className="flex-row flex-wrap items-center mt-1.5" style={{ gap: 8 }}>
+                          <View className="bg-slate-100 dark:bg-slate-700 px-2 py-1 rounded-md">
+                            <Text className="text-[10px] text-slate-500 dark:text-slate-300 font-bold">{templates.find(t => t.id === item.templateId)?.name || '未分類'}</Text>
                           </View>
-                        ) : null}
+                          {item.subLocation ? (
+                            <View className="flex-row items-center" style={{ gap: 4 }}>
+                              <MapPin size={10} color="#d97706" />
+                              <Text className="text-[10px] text-amber-600 font-bold">{item.subLocation}</Text>
+                            </View>
+                          ) : null}
+                        </View>
+                      </View>
+
+                      <View className="flex-row items-center bg-slate-50 dark:bg-slate-700 rounded-2xl p-1 self-center ml-2">
+                        <TouchableOpacity onPress={() => updateQuantity(item.id, -1)} className="p-1">
+                          <MinusCircle size={18} color="#94a3b8" />
+                        </TouchableOpacity>
+                        <Text className="w-6 text-center font-bold text-sm text-slate-800 dark:text-white">{item.quantity || 0}</Text>
+                        <TouchableOpacity onPress={() => updateQuantity(item.id, 1)} className="p-1">
+                          <PlusCircle size={18} color="#94a3b8" />
+                        </TouchableOpacity>
                       </View>
                     </View>
 
-                    <View className="flex-row items-center bg-slate-50 dark:bg-slate-700 rounded-2xl p-1 self-center ml-2">
-                      <TouchableOpacity onPress={() => updateQuantity(item.id, -1)} className="p-1">
-                        <MinusCircle size={18} color="#94a3b8" />
-                      </TouchableOpacity>
-                      <Text className="w-6 text-center font-bold text-sm text-slate-800 dark:text-white">{item.quantity || 0}</Text>
-                      <TouchableOpacity onPress={() => updateQuantity(item.id, 1)} className="p-1">
-                        <PlusCircle size={18} color="#94a3b8" />
-                      </TouchableOpacity>
-                    </View>
-                  </View>
-
-                  {item.attributes && Object.keys(item.attributes).length > 0 && (
-                    <View className="flex-row flex-wrap border-t border-slate-50 dark:border-slate-700 pt-3 mt-3" style={{ gap: 8 }}>
-                      {Object.entries(item.attributes).map(([key, val]) => {
-                        if (!val && val !== 'false') return null;
-                        const isCheckbox = val === 'true' || val === 'false';
-                        const isTag = !isCheckbox && (val.toString().startsWith('#') || key.toLowerCase().includes('タグ'));
-                        const isUrl = !isCheckbox && val.toString().startsWith('http');
-                        if (isCheckbox) {
+                    {item.attributes && Object.keys(item.attributes).length > 0 && (
+                      <View className="flex-row flex-wrap border-t border-slate-50 dark:border-slate-700 pt-3 mt-3" style={{ gap: 8 }}>
+                        {Object.entries(item.attributes).map(([key, val]) => {
+                          if (!val && val !== 'false') return null;
+                          const isCheckbox = val === 'true' || val === 'false';
+                          const isTag = !isCheckbox && (val.toString().startsWith('#') || key.toLowerCase().includes('タグ'));
+                          const isUrl = !isCheckbox && val.toString().startsWith('http');
+                          if (isCheckbox) {
+                            return (
+                              <View key={key} className="px-2 py-1.5 rounded-lg flex-row items-center bg-slate-50 dark:bg-slate-700" style={{ gap: 4 }}>
+                                {val === 'true'
+                                  ? <CheckSquare size={10} color="#d97706" />
+                                  : <Square size={10} color="#94a3b8" />
+                                }
+                                <Text className={`text-[10px] font-bold ${val === 'true' ? 'text-amber-600' : 'text-slate-400'}`}>
+                                  {key}
+                                </Text>
+                              </View>
+                            );
+                          }
                           return (
-                            <View key={key} className="px-2 py-1.5 rounded-lg flex-row items-center bg-slate-50 dark:bg-slate-700" style={{ gap: 4 }}>
-                              {val === 'true'
-                                ? <CheckSquare size={10} color="#d97706" />
-                                : <Square size={10} color="#94a3b8" />
+                            <TouchableOpacity
+                              key={key}
+                              onPress={() => isUrl
+                                ? WebBrowser.openBrowserAsync(val.toString())
+                                : setActiveAttributeFilter({ key, value: val })
                               }
-                              <Text className={`text-[10px] font-bold ${val === 'true' ? 'text-amber-600' : 'text-slate-400'}`}>
-                                {key}
+                              className={`px-2 py-1.5 rounded-lg flex-row items-center ${
+                                isTag ? 'bg-amber-100 dark:bg-amber-900/30' : isUrl ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-slate-50 dark:bg-slate-700'
+                              }`}
+                              style={{ gap: 4 }}
+                            >
+                              {isTag ? <Hash size={9} color="#b45309" /> : isUrl ? <ExternalLink size={9} color="#2563eb" /> : <Tag size={9} color="#64748b" />}
+                              <Text className={`text-[10px] font-bold ${isTag ? 'text-amber-700 dark:text-amber-400' : isUrl ? 'text-blue-600 dark:text-blue-400' : 'text-slate-500 dark:text-slate-300'}`}>
+                                {isUrl ? key : val}
                               </Text>
-                            </View>
+                            </TouchableOpacity>
                           );
-                        }
-                        return (
-                          <TouchableOpacity
-                            key={key}
-                            onPress={() => setActiveAttributeFilter({ key, value: val })}
-                            className={`px-2 py-1.5 rounded-lg flex-row items-center ${
-                              isTag ? 'bg-amber-100 dark:bg-amber-900/30' : isUrl ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-slate-50 dark:bg-slate-700'
-                            }`}
-                            style={{ gap: 4 }}
-                          >
-                            {isTag ? <Hash size={9} color="#b45309" /> : isUrl ? <ExternalLink size={9} color="#2563eb" /> : <Tag size={9} color="#64748b" />}
-                            <Text className={`text-[10px] font-bold ${isTag ? 'text-amber-700 dark:text-amber-400' : isUrl ? 'text-blue-600 dark:text-blue-400' : 'text-slate-500 dark:text-slate-300'}`}>
-                              {val}
-                            </Text>
-                          </TouchableOpacity>
-                        );
-                      })}
-                    </View>
-                  )}
-                </TouchableOpacity>
+                        })}
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                </DraggableRow>
               ))}
               {filteredItems.length === 0 && (
                 <View className="items-center justify-center py-20" style={{ gap: 8 }}>
@@ -660,20 +808,30 @@ export default function App() {
               </View>
             </View>
             <View style={{ gap: 12 }}>
-              {templates.map(t => (
-                <TouchableOpacity 
-                  key={t.id} onPress={() => { setTemplateToEdit(t); setIsAddingTemplate(true); }} 
-                  className="bg-white dark:bg-slate-800 p-4 rounded-3xl border border-slate-100 dark:border-slate-700 flex-row items-center justify-between"
+              {templates.map((t, index) => (
+                <DraggableRow
+                  key={t.id}
+                  onDelete={() => handleDeleteTemplate(t.id)}
+                  onDragStart={() => {}}
+                  onDragEnd={(dy) => {
+                    const delta = Math.round(dy / 72);
+                    if (delta !== 0) handleReorderTemplates(index, Math.max(0, Math.min(templates.length - 1, index + delta)));
+                  }}
                 >
-                  <View className="flex-row items-center flex-1" style={{ gap: 12 }}>
-                    <View className="p-2.5 bg-amber-50 dark:bg-slate-700 rounded-2xl"><Layers size={20} color="#d97706" /></View>
-                    <View className="flex-1">
-                      <Text className="font-bold text-slate-800 dark:text-white text-base" numberOfLines={1}>{t.name}</Text>
-                      <Text className="text-[10px] text-slate-400 font-bold mt-1">{t.subLocations?.length || 0} 階層 / {t.attributes?.length || 0} 属性</Text>
+                  <TouchableOpacity
+                    onPress={() => { setTemplateToEdit(t); setIsAddingTemplate(true); }}
+                    className="flex-1 bg-white dark:bg-slate-800 p-4 rounded-3xl border border-slate-100 dark:border-slate-700 flex-row items-center justify-between"
+                  >
+                    <View className="flex-row items-center flex-1" style={{ gap: 12 }}>
+                      <View className="p-2.5 bg-amber-50 dark:bg-slate-700 rounded-2xl"><Layers size={20} color="#d97706" /></View>
+                      <View className="flex-1">
+                        <Text className="font-bold text-slate-800 dark:text-white text-base" numberOfLines={1}>{t.name}</Text>
+                        <Text className="text-[10px] text-slate-400 font-bold mt-1">{t.subLocations?.length || 0} 階層 / {t.attributes?.length || 0} 属性</Text>
+                      </View>
                     </View>
-                  </View>
-                  <ChevronRight size={18} color="#cbd5e1" />
-                </TouchableOpacity>
+                    <ChevronRight size={18} color="#cbd5e1" />
+                  </TouchableOpacity>
+                </DraggableRow>
               ))}
             </View>
           </View>
@@ -703,6 +861,43 @@ export default function App() {
             </View>
 
             <View style={{ gap: 12 }}>
+              <Text className="text-xs font-bold text-slate-400 ml-2">通知設定</Text>
+              <View className="bg-white dark:bg-slate-800 rounded-3xl overflow-hidden border border-slate-100 dark:border-slate-700">
+                <View className="p-4 border-b border-slate-100 dark:border-slate-700">
+                  <View className="flex-row items-center mb-3" style={{ gap: 8 }}>
+                    <Bell size={16} color="#d97706" />
+                    <Text className="text-xs font-bold text-slate-600 dark:text-slate-300">期限の何日前に通知するか</Text>
+                  </View>
+                  <View className="flex-row flex-wrap" style={{ gap: 8 }}>
+                    {[1, 3, 5, 7].map(days => (
+                      <TouchableOpacity
+                        key={days}
+                        onPress={() => changeNotifyDays(days)}
+                        className={`px-4 py-2 rounded-xl border ${notifyDaysBefore === days ? 'bg-amber-600 border-amber-600' : 'bg-slate-50 dark:bg-slate-700 border-slate-200 dark:border-slate-600'}`}
+                      >
+                        <Text className={`text-xs font-bold ${notifyDaysBefore === days ? 'text-white' : 'text-slate-600 dark:text-slate-300'}`}>{days}日前</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+                <View className="p-4">
+                  <Text className="text-xs font-bold text-slate-600 dark:text-slate-300 mb-3">通知時刻</Text>
+                  <View className="flex-row flex-wrap" style={{ gap: 8 }}>
+                    {[7, 9, 12, 18, 20].map(hour => (
+                      <TouchableOpacity
+                        key={hour}
+                        onPress={() => changeNotifyHour(hour)}
+                        className={`px-4 py-2 rounded-xl border ${notifyHour === hour ? 'bg-amber-600 border-amber-600' : 'bg-slate-50 dark:bg-slate-700 border-slate-200 dark:border-slate-600'}`}
+                      >
+                        <Text className={`text-xs font-bold ${notifyHour === hour ? 'text-white' : 'text-slate-600 dark:text-slate-300'}`}>{hour}時</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+              </View>
+            </View>
+
+            <View style={{ gap: 12 }}>
               <Text className="text-xs font-bold text-slate-400 ml-2">データ管理 (バックアップ)</Text>
               <View className="bg-white dark:bg-slate-800 rounded-3xl overflow-hidden border border-slate-100 dark:border-slate-700">
                 <TouchableOpacity onPress={handleExportData} className="flex-row items-center p-4 border-b border-slate-100 dark:border-slate-700">
@@ -728,16 +923,20 @@ export default function App() {
 
       {/* Floating Action Button */}
       {activeTab === 'library' && (
-        <TouchableOpacity 
-          onPress={() => { setItemToEdit(null); setIsAddingItem(true); }} 
-          className="absolute right-6 bottom-24 w-14 h-14 bg-amber-600 rounded-full shadow-lg items-center justify-center z-20"
+        <TouchableOpacity
+          onPress={() => { setItemToEdit(null); setIsAddingItem(true); }}
+          className="absolute right-6 w-14 h-14 bg-amber-600 rounded-full shadow-lg items-center justify-center z-20"
+          style={{ bottom: 64 + insets.bottom + 16 }}
         >
           <Plus size={28} color="white" />
         </TouchableOpacity>
       )}
 
       {/* Navigation Bar */}
-      <View className="absolute bottom-0 left-0 right-0 bg-white/95 dark:bg-slate-900/95 border-t border-slate-200 dark:border-slate-800 flex-row justify-around items-center px-4 pb-6 pt-2 z-10">
+      <View
+        className="absolute bottom-0 left-0 right-0 bg-white/95 dark:bg-slate-900/95 border-t border-slate-200 dark:border-slate-800 flex-row justify-around items-center px-4 pt-2 z-10"
+        style={{ paddingBottom: Math.max(insets.bottom, 8) }}
+      >
         <SidebarItem id="dashboard" icon={LayoutDashboard} label="ホーム" />
         <SidebarItem id="library" icon={Library} label="ライブラリ" />
         <SidebarItem id="templates" icon={Layers} label="テンプレート" />
